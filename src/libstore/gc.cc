@@ -670,6 +670,16 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     auto deleteReferrersClosure = [&](const StorePath & start, uint64_t count) {
         StorePathSet visited;
         std::queue<StorePath> todo;
+        /* This map is the inverse of `referrersCache` for the nodes that we've encountered
+         * during this run of `deleteReferrersClosure`. Unlike `referrersCache`, which is
+         * obtained by querying the database and therefore has complete sets of referrers,
+         * this is NOT in general complete.
+         *
+         * This is okay, because our algorithm does not require a complete view of references,
+         * only a complete view of referrers (since "no marked-alive referrers exist" is our
+         * condition for marking a path as dead). Instead, this map is only used to help us
+         * step through `visited` in a roughly topological order. */
+        std::unordered_map<StorePath, std::unordered_set<StorePath>> referenceCache;
 
         /* Wake up any GC client waiting for deletion of the paths in
            'visited' to finish. */
@@ -679,12 +689,22 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             wakeup.notify_all();
         });
 
-        auto enqueue = [&](const StorePath & path) {
-            if (visited.insert(path).second)
+        auto enqueue = [&](const StorePath * parent, const StorePath & path) {
+            if (visited.insert(path).second) {
                 todo.push(path);
+
+                if (parent) {
+                    auto i = referenceCache.find(path);
+                    if (i == referenceCache.end()) {
+                        referenceCache.emplace(path, std::unordered_set<StorePath>{*parent});
+                    } else {
+                        i->second.insert(*parent);
+                    }
+                }
+            }
         };
 
-        enqueue(start);
+        enqueue(nullptr, start);
 
         while (auto path = pop(todo)) {
             checkInterrupt();
@@ -702,15 +722,24 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
             auto markAlive = [&]()
             {
-                alive.insert(*path);
-                alive.insert(start);
-                try {
-                    StorePathSet closure;
-                    computeFSClosure(*path, closure,
-                        /* flipDirection */ false, gcKeepOutputs, gcKeepDerivations);
-                    for (auto & p : closure)
-                        alive.insert(p);
-                } catch (InvalidPath &) { }
+                std::queue<StorePath> toMark;
+                toMark.push(*path);
+                while (auto next = pop(toMark)) {
+                    alive.insert(*next);
+
+                    auto i = referenceCache.find(*next);
+                    if (i != referenceCache.end()) {
+                        for (const auto & next : i->second)
+                            toMark.push(next);
+                        // Erase elements from the referenceCache, since once we have marked these
+                        // nodes and their references as "alive" we won't ever need them again,
+                        // and if we don't erase we may get caught up by reference cycles.
+                        referenceCache.erase(i);
+                    }
+
+                }
+
+                assert(alive.count(start));
             };
 
             /* If this is a root, bail out. */
@@ -744,7 +773,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     i = referrersCache.find(*path);
                 }
                 for (auto & p : i->second)
-                    enqueue(p);
+                    enqueue(&*path, p);
 
                 /* If keep-derivations is set and this is a
                    derivation, then visit the derivation outputs. */
@@ -753,14 +782,14 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         if (maybeOutPath &&
                             isValidPath(*maybeOutPath) &&
                             queryPathInfo(*maybeOutPath)->deriver == *path)
-                            enqueue(*maybeOutPath);
+                            enqueue(&*path, *maybeOutPath);
                 }
 
                 /* If keep-outputs is set, then visit the derivers. */
                 if (gcKeepOutputs) {
                     auto derivers = queryValidDerivers(*path);
                     for (auto & i : derivers)
-                        enqueue(i);
+                        enqueue(&*path, i);
                 }
             }
         }
