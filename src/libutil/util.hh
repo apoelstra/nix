@@ -273,6 +273,18 @@ std::optional<typename T::value_type> pop(T & c)
     return v;
 }
 
+/**
+ * Remove and return the last item from a container.
+ */
+template <class T>
+std::optional<typename T::value_type> pop_back(T & c)
+{
+    if (c.empty()) return {};
+    auto v = std::move(c.back());
+    c.pop_back();
+    return v;
+}
+
 
 template<typename T>
 class Callback;

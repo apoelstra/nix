@@ -666,7 +666,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        output edges. If none of those paths are roots, then all
        visited paths are garbage and are deleted. */
     auto deleteReferrersClosure = [&](const StorePath & start, uint64_t count) {
-        std::queue<StorePath> todo;
+        std::vector<StorePath> todo;
 
         /* Maps store paths to all the paths that refer to them. This map is populated by
          * the referrers from database, from derivation outputs (if `gcKeepDerivations` is
@@ -714,12 +714,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
             }
 
-            todo.push(path);
+            todo.push_back(path);
         };
 
         enqueue(nullptr, start);
 
-        while (auto path = pop(todo)) {
+        while (auto path = pop_back(todo)) {
             checkInterrupt();
 
             /* Bail out if we've previously discovered that this path
