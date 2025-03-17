@@ -666,7 +666,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        output edges. If none of those paths are roots, then all
        visited paths are garbage and are deleted. */
     auto deleteReferrersClosure = [&](const StorePath & start, uint64_t count) {
-        std::vector<StorePath> todo;
+        /* List of upcoming paths to visit.
+         *
+         * If the boolean is true, this is a path to visit. If it's false, that means
+         * that we're done visiting the path and all its descendants, and we should
+         * remove it from `currentReferencePath`. */
+        std::vector<std::pair<StorePath, bool>> todo;
 
         /* Maps store paths to all the paths that refer to them. This map is populated by
          * the referrers from database, from derivation outputs (if `gcKeepDerivations` is
@@ -685,6 +690,15 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
          * condition for marking a path as dead). Instead, this map is only used to help us
          * step through the keys of `referrersCache` in a roughly reverse topological order. */
         std::unordered_map<StorePath, std::unordered_set<StorePath>> referenceCache;
+        /* The full current branch of the referrers DAG that we've currently traversed. This
+         * is used for cycle detection. When we detect a cycle, we explicitly don't record
+         * the referrer map from the already-seen node to the previous node in `referrersCache`.
+         *
+         * This ensures that nodes that would be roots except for cyclic references are counted
+         * as roots. This does not break our traversal logic during aliveness-marking or deletion
+         * because we traverse using `referenceCache` and only use `referrersCache` for deciding
+         * whether something is a root or not. */
+        std::unordered_set<StorePath> currentReferencePath;
 
         /* Wake up any GC client waiting for deletion of the paths in
            'referrersCache' to finish. */
@@ -714,13 +728,23 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
             }
 
-            todo.push_back(path);
+            todo.push_back({path, true});
         };
 
         enqueue(nullptr, start);
 
-        while (auto path = pop_back(todo)) {
+        while (const auto path_visit = pop_back(todo)) {
             checkInterrupt();
+
+            // FIXME the following is a pointer just to minimize the diff of this commit. Will
+            // convert it to a reference in the next commit.
+            const auto * path = &path_visit->first;
+            if (!path_visit->second) {
+                currentReferencePath.erase(*path);
+                continue;
+            }
+            currentReferencePath.insert(*path);
+            todo.push_back({*path, false});
 
             /* Bail out if we've previously discovered that this path
                is alive. */
@@ -745,8 +769,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         for (const auto & next : i->second)
                             toMark.push(next);
                         // Erase elements from the referenceCache, since once we have marked these
-                        // nodes and their references as "alive" we won't ever need them again,
-                        // and if we don't erase we may get caught up by reference cycles.
+                        // nodes and their references as "alive" we won't ever need them again.
                         referenceCache.erase(i);
                     }
 
@@ -781,11 +804,13 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (ref_it == referrersCache.end()) {
                     StorePathSet referrers;
                     queryGCReferrers(*path, referrers);
+                    std::erase_if(referrers, [&](StorePath p) { return currentReferencePath.contains(p); });
                     ref_it = referrersCache.emplace(*path, std::move(referrers)).first;
                 } else {
                     // We've seen this path already.
                     continue;
                 }
+
                 for (auto & p : ref_it->second)
                     enqueue(&*path, p);
 
@@ -794,6 +819,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (gcKeepDerivations && path->isDerivation()) {
                     for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
                         if (maybeOutPath &&
+                            !currentReferencePath.contains(*maybeOutPath) &&
                             isValidPath(*maybeOutPath) &&
                             queryPathInfo(*maybeOutPath)->deriver == *path) {
                             ref_it->second.emplace(*maybeOutPath);
@@ -804,10 +830,11 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 /* If keep-outputs is set, then visit the derivers. */
                 if (gcKeepOutputs) {
                     auto derivers = queryValidDerivers(*path);
-                    for (auto & i : derivers) {
-                        ref_it->second.emplace(i);
-                        enqueue(&*path, i);
-                    }
+                    for (auto & i : derivers)
+                        if (!currentReferencePath.contains(i)) {
+                            ref_it->second.emplace(i);
+                            enqueue(&*path, i);
+                        }
                 }
             } else {
                 /* Because we are using the key set of `referrersCache` as a cache of which
