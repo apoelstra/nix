@@ -630,7 +630,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* Helper function that deletes a path from the store and throws
        GCLimitReached if we've deleted enough garbage. */
-    auto deleteFromStore = [&](std::string_view baseName)
+    auto deleteFromStore = [&](std::string_view baseName, uint64_t count)
     {
         Path path = storeDir + "/" + std::string(baseName);
         Path realPath = realStoreDir + "/" + std::string(baseName);
@@ -646,7 +646,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             }
         }
 
-        printInfo("deleting '%1%'", path);
+        printInfo("Scanned %1% store paths; deleting '%2%'", count, path);
 
         results.paths.insert(path);
 
@@ -667,7 +667,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        via the referrers edges and optionally derivers and derivation
        output edges. If none of those paths are roots, then all
        visited paths are garbage and are deleted. */
-    auto deleteReferrersClosure = [&](const StorePath & start) {
+    auto deleteReferrersClosure = [&](const StorePath & start, uint64_t count) {
         StorePathSet visited;
         std::queue<StorePath> todo;
 
@@ -769,7 +769,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             if (shouldDelete) {
                 try {
                     invalidatePathChecked(path);
-                    deleteFromStore(path.to_string());
+                    deleteFromStore(path.to_string(), count);
                     referrersCache.erase(path);
                 } catch (PathInUse &e) {
                     // If we end up here, it's likely a new occurence
@@ -784,8 +784,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        paths (for gcDeleteSpecific). */
     if (options.action == GCOptions::gcDeleteSpecific) {
 
+        uint64_t count = 0;
         for (auto & i : options.pathsToDelete) {
-            deleteReferrersClosure(i);
+            ++count;
+            deleteReferrersClosure(i, count);
             if (!dead.count(i))
                 throw Error(
                     "Cannot delete path '%1%' since it is still alive. "
@@ -811,15 +813,17 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             auto linksName = baseNameOf(linksDir);
             Paths entries;
             struct dirent * dirent;
+            uint64_t count = 0;
             while (errno = 0, dirent = readdir(dir.get())) {
+                ++count;
                 checkInterrupt();
                 std::string name = dirent->d_name;
                 if (name == "." || name == ".." || name == linksName) continue;
 
                 if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
-                    deleteReferrersClosure(*storePath);
+                    deleteReferrersClosure(*storePath, count);
                 else
-                    deleteFromStore(name);
+                    deleteFromStore(name, count);
 
             }
         } catch (GCLimitReached & e) {
