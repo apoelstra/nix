@@ -736,31 +736,29 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         while (const auto path_visit = pop_back(todo)) {
             checkInterrupt();
 
-            // FIXME the following is a pointer just to minimize the diff of this commit. Will
-            // convert it to a reference in the next commit.
-            const auto * path = &path_visit->first;
+            const auto & path = path_visit->first;
             if (!path_visit->second) {
-                currentReferencePath.erase(*path);
+                currentReferencePath.erase(path);
                 continue;
             }
-            currentReferencePath.insert(*path);
-            todo.push_back({*path, false});
+            currentReferencePath.insert(path);
+            todo.push_back({path, false});
 
             /* Bail out if we've previously discovered that this path
                is alive. */
-            if (alive.count(*path)) {
+            if (alive.count(path)) {
                 alive.insert(start);
                 return;
             }
 
             /* If we've previously deleted this path, we don't have to
                handle it again. */
-            if (dead.count(*path)) continue;
+            if (dead.count(path)) continue;
 
             auto markAlive = [&]()
             {
                 std::queue<StorePath> toMark;
-                toMark.push(*path);
+                toMark.push(path);
                 while (auto next = pop(toMark)) {
                     alive.insert(*next);
 
@@ -779,61 +777,61 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             };
 
             /* If this is a root, bail out. */
-            if (roots.count(*path)) {
-                debug("cannot delete '%s' because it's a root", printStorePath(*path));
+            if (roots.count(path)) {
+                debug("cannot delete '%s' because it's a root", printStorePath(path));
                 return markAlive();
             }
 
             if (options.action == GCOptions::gcDeleteSpecific
-                && !options.pathsToDelete.count(*path))
+                && !options.pathsToDelete.count(path))
                 return;
 
             {
-                auto hashPart = std::string(path->hashPart());
+                auto hashPart = std::string(path.hashPart());
                 auto shared(_shared.lock());
                 if (shared->tempRoots.count(hashPart)) {
-                    debug("cannot delete '%s' because it's a temporary root", printStorePath(*path));
+                    debug("cannot delete '%s' because it's a temporary root", printStorePath(path));
                     return markAlive();
                 }
                 shared->pending = hashPart;
             }
 
-            auto ref_it = referrersCache.find(*path);
-            if (isValidPath(*path)) {
+            auto ref_it = referrersCache.find(path);
+            if (isValidPath(path)) {
                 /* Visit the referrers of this path. */
                 if (ref_it == referrersCache.end()) {
                     StorePathSet referrers;
-                    queryGCReferrers(*path, referrers);
+                    queryGCReferrers(path, referrers);
                     std::erase_if(referrers, [&](StorePath p) { return currentReferencePath.contains(p); });
-                    ref_it = referrersCache.emplace(*path, std::move(referrers)).first;
+                    ref_it = referrersCache.emplace(path, std::move(referrers)).first;
                 } else {
                     // We've seen this path already.
                     continue;
                 }
 
                 for (auto & p : ref_it->second)
-                    enqueue(&*path, p);
+                    enqueue(&path, p);
 
                 /* If keep-derivations is set and this is a
                    derivation, then visit the derivation outputs. */
-                if (gcKeepDerivations && path->isDerivation()) {
-                    for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
+                if (gcKeepDerivations && path.isDerivation()) {
+                    for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(path))
                         if (maybeOutPath &&
                             !currentReferencePath.contains(*maybeOutPath) &&
                             isValidPath(*maybeOutPath) &&
-                            queryPathInfo(*maybeOutPath)->deriver == *path) {
+                            queryPathInfo(*maybeOutPath)->deriver == path) {
                             ref_it->second.emplace(*maybeOutPath);
-                            enqueue(&*path, *maybeOutPath);
+                            enqueue(&path, *maybeOutPath);
                         }
                 }
 
                 /* If keep-outputs is set, then visit the derivers. */
                 if (gcKeepOutputs) {
-                    auto derivers = queryValidDerivers(*path);
+                    auto derivers = queryValidDerivers(path);
                     for (auto & i : derivers)
                         if (!currentReferencePath.contains(i)) {
                             ref_it->second.emplace(i);
-                            enqueue(&*path, i);
+                            enqueue(&path, i);
                         }
                 }
             } else {
@@ -841,7 +839,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                  * paths we've visited, we must add even invalid paths to `referrersCache`,
                  * even though definitionally they have no referrers. */
                 if (ref_it == referrersCache.end())
-                    ref_it = referrersCache.emplace(*path, StorePathSet{}).first;
+                    ref_it = referrersCache.emplace(path, StorePathSet{}).first;
             }
         }
 
