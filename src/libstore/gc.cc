@@ -630,7 +630,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* Helper function that deletes a path from the store and throws
        GCLimitReached if we've deleted enough garbage. */
-    auto deleteFromStore = [&](std::string_view baseName, uint64_t count)
+    auto deleteFromStore = [&](std::string_view baseName, uint64_t count, uint64_t subcount, uint64_t subtotal)
     {
         Path path = storeDir + "/" + std::string(baseName);
         Path realPath = realStoreDir + "/" + std::string(baseName);
@@ -646,7 +646,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             }
         }
 
-        printInfo("Scanned %1% store paths; deleting '%2%'", count, path);
+        printInfo("Store path %1% (%2%/%3%): deleting '%4%'", count, subcount, subtotal, path);
 
         results.paths.insert(path);
 
@@ -764,12 +764,16 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
             }
         }
+
+        uint64_t subcount = 0;
+        uint64_t subtotal = visited.size();
         for (auto & path : topoSortPaths(visited)) {
             if (!dead.insert(path).second) continue;
             if (shouldDelete) {
+                ++subcount;
                 try {
                     invalidatePathChecked(path);
-                    deleteFromStore(path.to_string(), count);
+                    deleteFromStore(path.to_string(), count, subcount, subtotal);
                     referrersCache.erase(path);
                 } catch (PathInUse &e) {
                     // If we end up here, it's likely a new occurence
@@ -823,7 +827,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
                     deleteReferrersClosure(*storePath, count);
                 else
-                    deleteFromStore(name, count);
+                    deleteFromStore(name, count, 1, 1);
 
             }
         } catch (GCLimitReached & e) {
