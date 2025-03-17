@@ -661,15 +661,20 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
     };
 
-    std::unordered_map<StorePath, StorePathSet> referrersCache;
-
     /* Helper function that visits all paths reachable from `start`
        via the referrers edges and optionally derivers and derivation
        output edges. If none of those paths are roots, then all
        visited paths are garbage and are deleted. */
     auto deleteReferrersClosure = [&](const StorePath & start, uint64_t count) {
-        StorePathSet visited;
         std::queue<StorePath> todo;
+
+        /* Maps store paths to all the paths that refer to them. This map is populated by
+         * the referrers from database, from derivation outputs (if `gcKeepDerivations` is
+         * set) and from derivers (if `gcKeepOutputs` is set). It is used to compute the
+         * referrers closure of `start`. Its keyset represents the set of "visited but
+         * unprocessed" paths: when we first visit a path, we add it to the map, and when
+         * we mark it as `alive` or `dead` we remove it. */
+        std::unordered_map<StorePath, StorePathSet> referrersCache;
         /* This map is the inverse of `referrersCache` for the nodes that we've encountered
          * during this run of `deleteReferrersClosure`. Unlike `referrersCache`, which is
          * obtained by querying the database and therefore has complete sets of referrers,
@@ -678,30 +683,38 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
          * This is okay, because our algorithm does not require a complete view of references,
          * only a complete view of referrers (since "no marked-alive referrers exist" is our
          * condition for marking a path as dead). Instead, this map is only used to help us
-         * step through `visited` in a roughly topological order. */
+         * step through the keys of `referrersCache` in a roughly reverse topological order. */
         std::unordered_map<StorePath, std::unordered_set<StorePath>> referenceCache;
 
         /* Wake up any GC client waiting for deletion of the paths in
-           'visited' to finish. */
+           'referrersCache' to finish. */
         Finally releasePending([&]() {
             auto shared(_shared.lock());
             shared->pending.reset();
             wakeup.notify_all();
         });
 
+        /* Enqueues the path `path` to be visited.
+         *
+         * If `parent` is provided, this also stores a reference link from `path` to `parent`;
+         * if `path` is a valid path, it stores referrers links from `path` to all of its
+         * referrers, which it obtains by querying the database.
+         *
+         * To avoid repeated lookups in `referrersCache`, we expect the caller to populate
+         * that with a reference from `parent` back to `path`, rather than doing it here.
+         * The expectation is that `referrersCache` and `referenceCache` will be exact
+         * inverses. */
         auto enqueue = [&](const StorePath * parent, const StorePath & path) {
-            if (visited.insert(path).second) {
-                todo.push(path);
-
-                if (parent) {
-                    auto i = referenceCache.find(path);
-                    if (i == referenceCache.end()) {
-                        referenceCache.emplace(path, std::unordered_set<StorePath>{*parent});
-                    } else {
-                        i->second.insert(*parent);
-                    }
+            if (parent) {
+                auto i = referenceCache.find(path);
+                if (i == referenceCache.end()) {
+                    referenceCache.emplace(path, std::unordered_set<StorePath>{*parent});
+                } else {
+                    i->second.insert(*parent);
                 }
             }
+
+            todo.push(path);
         };
 
         enqueue(nullptr, start);
@@ -762,17 +775,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 shared->pending = hashPart;
             }
 
+            auto ref_it = referrersCache.find(*path);
             if (isValidPath(*path)) {
-
                 /* Visit the referrers of this path. */
-                auto i = referrersCache.find(*path);
-                if (i == referrersCache.end()) {
+                if (ref_it == referrersCache.end()) {
                     StorePathSet referrers;
                     queryGCReferrers(*path, referrers);
-                    referrersCache.emplace(*path, std::move(referrers));
-                    i = referrersCache.find(*path);
+                    ref_it = referrersCache.emplace(*path, std::move(referrers)).first;
+                } else {
+                    // We've seen this path already.
+                    continue;
                 }
-                for (auto & p : i->second)
+                for (auto & p : ref_it->second)
                     enqueue(&*path, p);
 
                 /* If keep-derivations is set and this is a
@@ -781,17 +795,34 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
                         if (maybeOutPath &&
                             isValidPath(*maybeOutPath) &&
-                            queryPathInfo(*maybeOutPath)->deriver == *path)
+                            queryPathInfo(*maybeOutPath)->deriver == *path) {
+                            ref_it->second.emplace(*maybeOutPath);
                             enqueue(&*path, *maybeOutPath);
+                        }
                 }
 
                 /* If keep-outputs is set, then visit the derivers. */
                 if (gcKeepOutputs) {
                     auto derivers = queryValidDerivers(*path);
-                    for (auto & i : derivers)
+                    for (auto & i : derivers) {
+                        ref_it->second.emplace(i);
                         enqueue(&*path, i);
+                    }
                 }
+            } else {
+                /* Because we are using the key set of `referrersCache` as a cache of which
+                 * paths we've visited, we must add even invalid paths to `referrersCache`,
+                 * even though definitionally they have no referrers. */
+                if (ref_it == referrersCache.end())
+                    ref_it = referrersCache.emplace(*path, StorePathSet{}).first;
             }
+        }
+
+        // FIXME will be removed in the next commit; it is needed now to produce an object
+        // that can be passed to `topoSortPaths`.
+        StorePathSet visited;
+        for (const auto & [key, value] : referrersCache) {
+            visited.insert(key);
         }
 
         uint64_t subcount = 0;
