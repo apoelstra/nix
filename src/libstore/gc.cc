@@ -733,6 +733,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
         enqueue(nullptr, start);
 
+        size_t subcount = 0;
+        const size_t subtotal = 0; // we no longer know this ahead of time
         while (const auto path_visit = pop_back(todo)) {
             checkInterrupt();
 
@@ -744,23 +746,13 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             currentReferencePath.insert(path);
             todo.push_back({path, false});
 
-            /* Bail out if we've previously discovered that this path
-               is alive. */
-            if (alive.count(path)) {
-                alive.insert(start);
-                return;
-            }
-
-            /* If we've previously deleted this path, we don't have to
-               handle it again. */
-            if (dead.count(path)) continue;
-
             auto markAlive = [&]()
             {
                 std::queue<StorePath> toMark;
                 toMark.push(path);
                 while (auto next = pop(toMark)) {
                     alive.insert(*next);
+                    referrersCache.erase(*next);
 
                     auto i = referenceCache.find(*next);
                     if (i != referenceCache.end()) {
@@ -776,10 +768,20 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 assert(alive.count(start));
             };
 
+            /* If we encounter an already-processed path, just skip it. */
+            if (dead.count(path))
+                continue;
+
+            if (alive.count(path)) {
+                markAlive();
+                continue;
+            }
+
             /* If this is a root, bail out. */
             if (roots.count(path)) {
                 debug("cannot delete '%s' because it's a root", printStorePath(path));
-                return markAlive();
+                markAlive();
+                continue;
             }
 
             if (options.action == GCOptions::gcDeleteSpecific
@@ -791,7 +793,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 auto shared(_shared.lock());
                 if (shared->tempRoots.count(hashPart)) {
                     debug("cannot delete '%s' because it's a temporary root", printStorePath(path));
-                    return markAlive();
+                    markAlive();
+                    continue;
                 }
                 shared->pending = hashPart;
             }
@@ -802,7 +805,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (ref_it == referrersCache.end()) {
                     StorePathSet referrers;
                     queryGCReferrers(path, referrers);
-                    std::erase_if(referrers, [&](StorePath p) { return currentReferencePath.contains(p); });
+                    std::erase_if(referrers, [&](StorePath p) { return currentReferencePath.contains(p) || dead.contains(p); });
                     ref_it = referrersCache.emplace(path, std::move(referrers)).first;
                 } else {
                     // We've seen this path already.
@@ -818,6 +821,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(path))
                         if (maybeOutPath &&
                             !currentReferencePath.contains(*maybeOutPath) &&
+                            !dead.contains(*maybeOutPath) &&
                             isValidPath(*maybeOutPath) &&
                             queryPathInfo(*maybeOutPath)->deriver == path) {
                             ref_it->second.emplace(*maybeOutPath);
@@ -829,7 +833,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (gcKeepOutputs) {
                     auto derivers = queryValidDerivers(path);
                     for (auto & i : derivers)
-                        if (!currentReferencePath.contains(i)) {
+                        if (!currentReferencePath.contains(i) && !dead.contains(i)) {
                             ref_it->second.emplace(i);
                             enqueue(&path, i);
                         }
@@ -841,32 +845,52 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (ref_it == referrersCache.end())
                     ref_it = referrersCache.emplace(path, StorePathSet{}).first;
             }
-        }
 
-        // FIXME will be removed in the next commit; it is needed now to produce an object
-        // that can be passed to `topoSortPaths`.
-        StorePathSet visited;
-        for (const auto & [key, value] : referrersCache) {
-            visited.insert(key);
-        }
+            // If this is a root and we didn't call markAlive above, then it's
+            // dead. Recursively delete it and any of its references that become
+            // dead roots after removing the reference to it.
 
-        uint64_t subcount = 0;
-        uint64_t subtotal = visited.size();
-        for (auto & path : topoSortPaths(visited)) {
-            if (!dead.insert(path).second) continue;
-            if (shouldDelete) {
-                ++subcount;
-                try {
-                    invalidatePathChecked(path);
-                    deleteFromStore(path.to_string(), count, subcount, subtotal);
-                    referrersCache.erase(path);
-                } catch (PathInUse &e) {
-                    // If we end up here, it's likely a new occurence
-                    // of https://github.com/NixOS/nix/issues/11923
-                    printError("BUG: %s", e.what());
+            if (ref_it->second.size() == 0 && !alive.count(path)) {
+                std::queue<StorePath> toDelete;
+                toDelete.push(path);
+                while (auto next = pop(toDelete)) {
+                    assert (dead.insert(*next).second);
+                    referrersCache.erase(*next);
+
+                    if (shouldDelete) {
+                        ++subcount;
+                        try {
+                            invalidatePathChecked(*next);
+                            deleteFromStore(next->to_string(), count, subcount, subtotal);
+                        } catch (PathInUse &e) {
+                            // If we end up here, it's likely a new occurence
+                            // of https://github.com/NixOS/nix/issues/11923
+                            printError("BUG: %s", e.what());
+                        }
+                    }
+
+                    auto i = referenceCache.find(*next);
+                    if (i != referenceCache.end()) {
+                        for (const auto & next_next : i->second) {
+                            if (alive.count(next_next))
+                                continue;
+                            assert(!dead.count(next_next));
+                            assert(referrersCache.contains(next_next));
+
+                            auto & referrers = referrersCache[next_next];
+                            referrers.erase(*next);
+                            if (referrers.size() == 0)
+                                toDelete.push(next_next);
+                        }
+                        // Erase elements from the referenceCache, since once we have marked this
+                        // node as "dead" we won't ever need its references again.
+                        referenceCache.erase(i);
+                    }
                 }
             }
         }
+        assert(referrersCache.size() == 0);
+        assert(referenceCache.size() == 0);
     };
 
     /* Either delete all garbage paths, or just the specified
